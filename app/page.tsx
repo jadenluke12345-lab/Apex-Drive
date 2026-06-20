@@ -34,6 +34,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { isSiteAdminFromMetadata } from "@/lib/admin";
 
 const MAPBOX_TOKEN = (process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? "").trim();
 const MAPBOX_BASEMAP_TOKEN = MAPBOX_TOKEN;
@@ -65,10 +66,6 @@ const FALLBACK_BASEMAP_STYLE = {
 };
 const FALLBACK_LOCATION = { lat: 47.6062, lng: -122.3321 };
 const FALLBACK_CITY_SECTOR_LABEL = "Seattle Sector";
-const ADMIN_EMAIL_ALLOWLIST = (process.env.NEXT_PUBLIC_ADMIN_EMAILS ?? "")
-  .split(",")
-  .map((email) => email.trim().toLowerCase())
-  .filter(Boolean);
 const GPS_MIN_DELTA = 0.00015;
 const NAVIGATION_REROUTE_MIN_DELTA = 0.00045;
 const NAVIGATION_REROUTE_INTERVAL_MS = 12000;
@@ -113,7 +110,7 @@ const SUBSCRIPTION_PLANS: ReadonlyArray<{
 }> = [
   { id: "starter", label: "Digital Garage", price: "Free • 2 slots + ads" },
   { id: "pro", label: "Apex Interceptor", price: "$7.99/mo • HUD + pace notes" },
-  { id: "elite", label: "Convoy Commander", price: "$49.99/yr • unlimited + admin" },
+  { id: "elite", label: "Convoy Commander", price: "$49.99/yr • unlimited garage + convoys" },
 ];
 
 type TabId =
@@ -267,6 +264,9 @@ interface RouteSubmission {
   notes: string;
   status: "pending" | "approved" | "rejected";
   submittedAt: number;
+  submitterName?: string;
+  submitterEmail?: string;
+  isOwn?: boolean;
 }
 
 interface FriendMapPresence {
@@ -987,6 +987,7 @@ export default function Dashboard() {
   const [isCheckoutLoading, setIsCheckoutLoading] = useState(false);
   const [isBillingPortalLoading, setIsBillingPortalLoading] = useState(false);
   const [isDeleteAccountLoading, setIsDeleteAccountLoading] = useState(false);
+  const [isDeleteAccountModalOpen, setIsDeleteAccountModalOpen] = useState(false);
   const [isProfileSaving, setIsProfileSaving] = useState(false);
   const [storageHydrated, setStorageHydrated] = useState(false);
 
@@ -1016,6 +1017,18 @@ export default function Dashboard() {
     () => planToTier(subscriptionForm.plan, subscriptionForm.active),
     [subscriptionForm.active, subscriptionForm.plan]
   );
+  const isSiteAdmin = useMemo(
+    () =>
+      isSiteAdminFromMetadata(
+        user?.publicMetadata,
+        user?.primaryEmailAddress?.emailAddress
+      ),
+    [user]
+  );
+  const effectiveUserTier = useMemo(
+    () => (isSiteAdmin ? "commander" : userTier),
+    [isSiteAdmin, userTier]
+  );
   const stripeBilling = useMemo(() => {
     const subscriptionMeta = user?.publicMetadata?.subscription;
     if (!subscriptionMeta || typeof subscriptionMeta !== "object") {
@@ -1031,15 +1044,16 @@ export default function Dashboard() {
           : null,
     };
   }, [user]);
-  const garageLimit = useMemo(() => tierGarageLimit(userTier), [userTier]);
+  const garageLimit = useMemo(() => tierGarageLimit(effectiveUserTier), [effectiveUserTier]);
   const isGarageAtCapacity =
     garageLimit != null && vehicles.length >= garageLimit;
-  const canUseHudAlerts = userTier === "interceptor" || userTier === "commander";
+  const canUseHudAlerts =
+    effectiveUserTier === "interceptor" || effectiveUserTier === "commander";
   const canUsePaceNotes = canUseHudAlerts;
-  const canUseCustomPaceNotes = userTier === "commander";
-  const canUseMeshNetwork = userTier === "commander";
-  const canManagePrivateConvoys = userTier === "commander";
-  const showDisplayAds = userTier === "free";
+  const canUseCustomPaceNotes = effectiveUserTier === "commander";
+  const canUseMeshNetwork = effectiveUserTier === "commander";
+  const canManagePrivateConvoys = effectiveUserTier === "commander";
+  const showDisplayAds = effectiveUserTier === "free";
   const mainNavTabs: Array<{
     id: TabId;
     label: string;
@@ -1100,30 +1114,7 @@ export default function Dashboard() {
     () => ROUTE_PRESETS.find((route) => route.id === selectedRouteId) ?? null,
     [selectedRouteId]
   );
-  const isRouteModerator = useMemo(() => {
-    const metadata =
-      user?.publicMetadata && typeof user.publicMetadata === "object"
-        ? (user.publicMetadata as Record<string, unknown>)
-        : null;
-    const roleValue = metadata?.role;
-    const rolesValue = metadata?.roles;
-
-    const roleCandidates: string[] = [];
-    if (typeof roleValue === "string") roleCandidates.push(roleValue);
-    if (Array.isArray(rolesValue)) {
-      roleCandidates.push(
-        ...rolesValue.filter((roleEntry): roleEntry is string => typeof roleEntry === "string")
-      );
-    }
-
-    const hasAdminRole = roleCandidates.some((roleName) =>
-      ["admin", "owner", "superadmin"].includes(roleName.toLowerCase())
-    );
-    if (hasAdminRole) return true;
-
-    const email = user?.primaryEmailAddress?.emailAddress?.toLowerCase() ?? "";
-    return Boolean(email && ADMIN_EMAIL_ALLOWLIST.includes(email));
-  }, [user]);
+  const isRouteModerator = isSiteAdmin;
   const selectedRouteStartDistance = useMemo(() => {
     if (!userLocation || !selectedRoutePreset) return null;
     return distanceMilesBetween(userLocation, {
@@ -1143,14 +1134,19 @@ export default function Dashboard() {
       : hasArrivedAtSelectedRouteStart
         ? "Arrived at route start."
         : `${formatRouteDistance(selectedRouteStartDistance)} to route start.`;
-  const pendingRouteSubmissionCount = useMemo(
-    () =>
-      routeSubmissions.filter((submission) => submission.status === "pending").length,
-    [routeSubmissions]
-  );
+  const pendingRouteSubmissionCount = useMemo(() => {
+    const source = isSiteAdmin
+      ? routeSubmissions
+      : routeSubmissions.filter((submission) => submission.isOwn);
+    return source.filter((submission) => submission.status === "pending").length;
+  }, [isSiteAdmin, routeSubmissions]);
   const approvedRouteSubmissions = useMemo(
     () =>
       routeSubmissions.filter((submission) => submission.status === "approved"),
+    [routeSubmissions]
+  );
+  const ownRouteSubmissions = useMemo(
+    () => routeSubmissions.filter((submission) => submission.isOwn),
     [routeSubmissions]
   );
   const asphaltIndicatorClasses = useMemo(() => {
@@ -1437,6 +1433,7 @@ export default function Dashboard() {
       if (isSearchResultsOpen) setIsSearchResultsOpen(false);
       if (isCreateConvoyOpen) setIsCreateConvoyOpen(false);
       if (isVehicleModalOpen) setIsVehicleModalOpen(false);
+      if (isDeleteAccountModalOpen) setIsDeleteAccountModalOpen(false);
     };
 
     document.addEventListener("mousedown", handlePointerDown);
@@ -1452,6 +1449,7 @@ export default function Dashboard() {
     isCreateConvoyOpen,
     isNotificationOpen,
     isSearchResultsOpen,
+    isDeleteAccountModalOpen,
     isVehicleModalOpen,
   ]);
 
@@ -1519,26 +1517,6 @@ export default function Dashboard() {
       `${storagePrefix}${STORAGE_KEYS.favorites}`
     );
     if (Array.isArray(storedFavorites)) setFavoriteRoutes(storedFavorites);
-
-    const storedRouteSubmissions = readStorage<RouteSubmission[]>(
-      `${storagePrefix}${STORAGE_KEYS.routeSubmissions}`
-    );
-    if (Array.isArray(storedRouteSubmissions)) {
-      const sanitizedRouteSubmissions = storedRouteSubmissions.filter(
-        (submission) =>
-          submission &&
-          typeof submission.id === "string" &&
-          typeof submission.name === "string" &&
-          typeof submission.startLabel === "string" &&
-          typeof submission.endLabel === "string" &&
-          typeof submission.notes === "string" &&
-          typeof submission.submittedAt === "number" &&
-          (submission.status === "pending" ||
-            submission.status === "approved" ||
-            submission.status === "rejected")
-      );
-      setRouteSubmissions(sanitizedRouteSubmissions);
-    }
 
     const storedNotifications = readStorage<NotificationItem[]>(
       `${storagePrefix}${STORAGE_KEYS.notifications}`
@@ -1637,11 +1615,6 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!storageHydrated || !storagePrefix) return;
-    writeStorage(`${storagePrefix}${STORAGE_KEYS.routeSubmissions}`, routeSubmissions);
-  }, [routeSubmissions, storageHydrated, storagePrefix]);
-
-  useEffect(() => {
-    if (!storageHydrated || !storagePrefix) return;
     writeStorage(`${storagePrefix}${STORAGE_KEYS.notifications}`, notifications);
   }, [notifications, storageHydrated, storagePrefix]);
 
@@ -1724,6 +1697,60 @@ export default function Dashboard() {
   }, [isSignedIn, isUserLoaded, storageHydrated]);
 
   useEffect(() => {
+    if (!isUserLoaded || !isSignedIn || !storageHydrated) return;
+
+    let cancelled = false;
+
+    async function loadCloudRouteSubmissions() {
+      try {
+        const endpoint = isSiteAdmin ? "/api/admin/moderation" : "/api/routes/submissions";
+        const response = await fetch(endpoint);
+        if (!response.ok || cancelled) return;
+
+        const payload = (await response.json()) as {
+          submissions?: Array<{
+            id: string;
+            name: string;
+            startLabel: string;
+            endLabel: string;
+            notes: string;
+            status: RouteSubmission["status"];
+            submittedAt: number;
+            submitterName?: string;
+            submitterEmail?: string;
+            isOwn?: boolean;
+          }>;
+        };
+
+        if (!Array.isArray(payload.submissions) || cancelled) return;
+
+        setRouteSubmissions(
+          payload.submissions.map((submission) => ({
+            id: submission.id,
+            name: submission.name,
+            startLabel: submission.startLabel,
+            endLabel: submission.endLabel,
+            notes: submission.notes,
+            status: submission.status,
+            submittedAt: submission.submittedAt,
+            submitterName: submission.submitterName,
+            submitterEmail: submission.submitterEmail,
+            isOwn: submission.isOwn,
+          }))
+        );
+      } catch {
+        // Keep empty submissions when cloud sync is unavailable.
+      }
+    }
+
+    void loadCloudRouteSubmissions();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isSignedIn, isSiteAdmin, isUserLoaded, storageHydrated]);
+
+  useEffect(() => {
     if (!user) return;
 
     const fullName =
@@ -1800,9 +1827,11 @@ export default function Dashboard() {
 
   useEffect(() => {
     setProfileForm((previous) =>
-      previous.tier === userTier ? previous : { ...previous, tier: userTier }
+      previous.tier === effectiveUserTier
+        ? previous
+        : { ...previous, tier: effectiveUserTier }
     );
-  }, [userTier]);
+  }, [effectiveUserTier]);
 
   useEffect(() => {
     if (!isMobileSidebarOpen) return;
@@ -3400,7 +3429,7 @@ export default function Dashboard() {
 
   const handleExportDriveStatistics = () => {
     const payload = {
-      tier: userTier,
+      tier: effectiveUserTier,
       exportedAt: new Date().toISOString(),
       statistics: driveStatistics,
       routePoints: routeTrackingHistory.length,
@@ -3428,7 +3457,7 @@ export default function Dashboard() {
 
     if (isGarageAtCapacity) {
       openTierGateModal(
-        userTier === "free"
+        effectiveUserTier === "free"
           ? "Free tier is capped at 2 vehicle slots. Upgrade to Apex Interceptor for 5 slots or Convoy Commander for unlimited garage capacity."
           : "Interceptor tier is capped at 5 vehicle slots. Upgrade to Convoy Commander for unlimited garage capacity."
       );
@@ -3501,7 +3530,7 @@ export default function Dashboard() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           ...profileForm,
-          tier: userTier,
+          tier: effectiveUserTier,
           avatarUrl: profileImageUrl || null,
         }),
       });
@@ -3520,7 +3549,7 @@ export default function Dashboard() {
         setProfileForm((previous) => ({
           ...previous,
           ...payload.profile,
-          tier: userTier,
+          tier: effectiveUserTier,
         }));
       }
 
@@ -3771,7 +3800,7 @@ export default function Dashboard() {
     });
   };
 
-  const handleSubmitRouteProposal = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleSubmitRouteProposal = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const trimmedName = routeSubmissionForm.name.trim();
     const trimmedStart = routeSubmissionForm.startLabel.trim();
@@ -3779,59 +3808,100 @@ export default function Dashboard() {
     const trimmedNotes = routeSubmissionForm.notes.trim();
     if (!trimmedName || !trimmedStart || !trimmedEnd) return;
 
-    const proposal: RouteSubmission = {
-      id: crypto.randomUUID(),
-      name: trimmedName,
-      startLabel: trimmedStart,
-      endLabel: trimmedEnd,
-      notes: trimmedNotes,
-      status: "pending",
-      submittedAt: Date.now(),
-    };
+    try {
+      const response = await fetch("/api/routes/submissions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: trimmedName,
+          startLabel: trimmedStart,
+          endLabel: trimmedEnd,
+          notes: trimmedNotes,
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        submission?: RouteSubmission;
+        error?: string;
+      };
 
-    setRouteSubmissions((previous) => [proposal, ...previous].slice(0, 25));
-    setRouteSubmissionForm({
-      name: "",
-      startLabel: "",
-      endLabel: "",
-      notes: "",
-    });
-    pushNotification({
-      type: "system",
-      text: `Route proposal "${proposal.name}" submitted for approval.`,
-    });
+      if (!response.ok || !payload.submission) {
+        throw new Error(payload.error ?? "Could not submit route for approval.");
+      }
+
+      setRouteSubmissions((previous) => {
+        const submission = {
+          ...payload.submission!,
+          isOwn: true,
+        };
+        const withoutDuplicate = previous.filter((entry) => entry.id !== submission.id);
+        return [submission, ...withoutDuplicate];
+      });
+      setRouteSubmissionForm({
+        name: "",
+        startLabel: "",
+        endLabel: "",
+        notes: "",
+      });
+      pushNotification({
+        type: "system",
+        text: `Route proposal "${payload.submission.name}" submitted for approval.`,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Could not submit route for approval.";
+      pushNotification({
+        type: "system",
+        text: message,
+      });
+    }
+  };
+
+  const moderateRouteSubmission = async (
+    submissionId: string,
+    action: "approve" | "reject"
+  ) => {
+    if (!isRouteModerator) return;
+
+    try {
+      const response = await fetch(`/api/admin/moderation/${submissionId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as {
+        submission?: RouteSubmission;
+        error?: string;
+      };
+
+      if (!response.ok || !payload.submission) {
+        throw new Error(payload.error ?? "Could not update route submission.");
+      }
+
+      setRouteSubmissions((previous) =>
+        previous.map((submission) =>
+          submission.id === submissionId ? payload.submission! : submission
+        )
+      );
+      pushNotification({
+        type: "system",
+        text: `${payload.submission.name} ${action === "approve" ? "approved" : "rejected"}.`,
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Could not update route submission.";
+      pushNotification({
+        type: "system",
+        text: message,
+      });
+    }
   };
 
   const approveRouteSubmission = (submissionId: string) => {
-    if (!isRouteModerator) return;
-    let submissionName = "Route submission";
-    setRouteSubmissions((previous) =>
-      previous.map((submission) => {
-        if (submission.id !== submissionId) return submission;
-        submissionName = submission.name;
-        return { ...submission, status: "approved" };
-      })
-    );
-    pushNotification({
-      type: "system",
-      text: `${submissionName} approved.`,
-    });
+    void moderateRouteSubmission(submissionId, "approve");
   };
 
   const rejectRouteSubmission = (submissionId: string) => {
-    if (!isRouteModerator) return;
-    let submissionName = "Route submission";
-    setRouteSubmissions((previous) =>
-      previous.map((submission) => {
-        if (submission.id !== submissionId) return submission;
-        submissionName = submission.name;
-        return { ...submission, status: "rejected" };
-      })
-    );
-    pushNotification({
-      type: "system",
-      text: `${submissionName} rejected.`,
-    });
+    void moderateRouteSubmission(submissionId, "reject");
   };
 
   const getRouteStartDistanceMiles = (route: RoutePreset): number | null => {
@@ -4122,11 +4192,6 @@ export default function Dashboard() {
   };
 
   const handleDeleteAccount = async () => {
-    const confirmed = window.confirm(
-      "Delete your Apex Drive account permanently? This cancels any active subscription and removes your profile data. This cannot be undone."
-    );
-    if (!confirmed) return;
-
     setIsDeleteAccountLoading(true);
     try {
       const response = await fetch("/api/account/delete", { method: "POST" });
@@ -4139,6 +4204,7 @@ export default function Dashboard() {
         throw new Error(payload.error ?? "Could not delete account.");
       }
 
+      setIsDeleteAccountModalOpen(false);
       window.location.href = "/sign-in";
     } catch (error) {
       const message =
@@ -5453,13 +5519,13 @@ export default function Dashboard() {
                   <p className="text-[10px] font-mono text-gray-400 uppercase tracking-wider mb-2">
                     Submitted Routes
                   </p>
-                  {routeSubmissions.length === 0 ? (
+                  {ownRouteSubmissions.length === 0 ? (
                     <p className="text-[11px] text-gray-500 leading-relaxed">
                       No route submissions yet. Use the form above to submit the first community route.
                     </p>
                   ) : (
                     <div className="space-y-2 max-h-[180px] overflow-y-auto pr-1">
-                      {routeSubmissions.map((submission) => (
+                      {ownRouteSubmissions.map((submission) => (
                         <div
                           key={submission.id}
                           className="bg-[#16171b] border border-white/[0.04] rounded-xl p-3"
@@ -5701,7 +5767,8 @@ export default function Dashboard() {
                     Manage exclusive private convoys, invitation-only group drives, and scheduled driving events.
                   </p>
                   <p className="text-[10px] font-mono text-[#00F2FE] mt-1 uppercase">
-                    Tier: {tierLabel(userTier)}
+                    Tier: {tierLabel(effectiveUserTier)}
+                    {isSiteAdmin ? " • Site Admin" : ""}
                   </p>
                 </div>
                 <button
@@ -5974,14 +6041,14 @@ export default function Dashboard() {
                   <p className="text-[10px] font-mono text-[#00F2FE] mt-1 uppercase">
                     {garageLimit == null
                       ? `${vehicles.length} vehicles • Unlimited slots (Commander)`
-                      : `${vehicles.length}/${garageLimit} slots • ${tierLabel(userTier)}`}
+                      : `${vehicles.length}/${garageLimit} slots • ${tierLabel(effectiveUserTier)}`}
                   </p>
                 </div>
                 <button
                   onClick={() => {
                     if (isGarageAtCapacity) {
                       openTierGateModal(
-                        userTier === "free"
+                        effectiveUserTier === "free"
                           ? "Free tier is capped at 2 vehicle slots. Upgrade to Apex Interceptor for 5 slots or Convoy Commander for unlimited garage capacity."
                           : "Interceptor tier is capped at 5 vehicle slots. Upgrade to Convoy Commander for unlimited garage capacity."
                       );
@@ -6618,19 +6685,23 @@ export default function Dashboard() {
                   <p className="text-white font-bold text-sm">Subscription</p>
                 </div>
 
-                {subscriptionForm.active ? (
+                {isSiteAdmin ? (
+                  <p className="text-xs text-amber-300 font-mono">
+                    Site owner access • {tierLabel(effectiveUserTier)} privileges • route moderation enabled
+                  </p>
+                ) : subscriptionForm.active ? (
                   <p className="text-xs text-emerald-400 font-mono">
                     Active plan:{" "}
                     {SUBSCRIPTION_PLANS.find((plan) => plan.id === subscriptionForm.plan)?.label ??
                       subscriptionForm.plan.toUpperCase()}{" "}
-                    • Tier: {tierLabel(userTier)}
+                    • Tier: {tierLabel(effectiveUserTier)}
                     {subscriptionForm.startedAt
                       ? ` • Renews ${new Date(subscriptionForm.startedAt).toLocaleDateString()}`
                       : ""}
                   </p>
                 ) : (
                   <p className="text-xs text-gray-400">
-                    Current tier: {tierLabel(userTier)}. Upgrade to unlock premium features.
+                    Current tier: {tierLabel(effectiveUserTier)}. Upgrade to unlock premium features.
                   </p>
                 )}
 
@@ -6705,9 +6776,15 @@ export default function Dashboard() {
                     </span>
                   </div>
                   <p className="text-xs text-gray-400">
-                    Approve or reject user-submitted community routes. This panel is visible only
-                    to admin accounts.
+                    Approve or reject user-submitted community routes before they go live for all
+                    drivers.
                   </p>
+                  <Link
+                    href="/admin"
+                    className="inline-flex items-center justify-center bg-amber-500/10 border border-amber-500/30 text-amber-200 font-bold py-2.5 px-4 rounded-xl text-[10px] font-mono uppercase tracking-wider hover:text-amber-100 transition-all min-h-[44px]"
+                  >
+                    Open Admin Dashboard
+                  </Link>
                   {routeSubmissions.length === 0 ? (
                     <p className="text-xs text-gray-500 leading-relaxed">
                       No route submissions are waiting for review.
@@ -6732,6 +6809,9 @@ export default function Dashboard() {
                               )}
                               <p className="text-[9px] font-mono text-gray-600 mt-1">
                                 Submitted {formatTimeAgo(submission.submittedAt)}
+                                {submission.submitterEmail
+                                  ? ` • ${submission.submitterEmail}`
+                                  : ""}
                               </p>
                             </div>
                             <div className="text-right">
@@ -6803,10 +6883,10 @@ export default function Dashboard() {
                 <button
                   type="button"
                   disabled={isDeleteAccountLoading}
-                  onClick={() => void handleDeleteAccount()}
+                  onClick={() => setIsDeleteAccountModalOpen(true)}
                   className="bg-rose-500/10 border border-rose-500/30 text-rose-300 font-bold py-2.5 px-4 rounded-xl text-[10px] font-mono uppercase tracking-wider hover:text-rose-200 hover:border-rose-400/40 transition-all min-h-[44px] disabled:opacity-50"
                 >
-                  {isDeleteAccountLoading ? "Deleting Account..." : "Delete Account"}
+                  Delete Account
                 </button>
               </div>
             </form>
@@ -6912,6 +6992,57 @@ export default function Dashboard() {
         </div>
       )}
 
+      {isDeleteAccountModalOpen && (
+        <div
+          className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 animate-fadeIn"
+          onClick={() => {
+            if (!isDeleteAccountLoading) setIsDeleteAccountModalOpen(false);
+          }}
+        >
+          <div
+            className="bg-[#111215] border border-rose-500/30 rounded-2xl w-full max-w-[460px] mx-4 p-6 shadow-2xl relative"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              disabled={isDeleteAccountLoading}
+              onClick={() => setIsDeleteAccountModalOpen(false)}
+              className="absolute top-4 right-4 text-gray-500 hover:text-white transition-all disabled:opacity-50"
+            >
+              <X className="h-4 w-4" />
+            </button>
+            <div className="flex items-center gap-2 mb-3">
+              <Trash2 className="h-4 w-4 text-rose-400" />
+              <h3 className="text-base font-bold text-white uppercase font-mono">
+                Delete Account?
+              </h3>
+            </div>
+            <p className="text-sm text-gray-300 leading-relaxed">
+              This permanently removes your Apex Drive account, cancels any active subscription,
+              and deletes your profile data. This cannot be undone.
+            </p>
+            <div className="mt-4 flex items-center gap-2">
+              <button
+                type="button"
+                disabled={isDeleteAccountLoading}
+                onClick={() => void handleDeleteAccount()}
+                className="bg-rose-500/20 border border-rose-500/40 text-rose-200 font-bold py-2 px-4 rounded-xl text-xs font-mono uppercase disabled:opacity-50"
+              >
+                {isDeleteAccountLoading ? "Deleting..." : "Yes, Delete Permanently"}
+              </button>
+              <button
+                type="button"
+                disabled={isDeleteAccountLoading}
+                onClick={() => setIsDeleteAccountModalOpen(false)}
+                className="bg-white/[0.04] border border-white/10 text-gray-300 font-bold py-2 px-4 rounded-xl text-xs font-mono uppercase disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {isTierGateModalOpen && (
         <div
           className="absolute inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 animate-fadeIn"
@@ -6934,7 +7065,8 @@ export default function Dashboard() {
             </div>
             <p className="text-sm text-gray-300 leading-relaxed">{tierGateMessage}</p>
             <p className="text-[10px] font-mono text-gray-500 mt-3 uppercase">
-              Current tier: {tierLabel(userTier)}
+              Current tier: {tierLabel(effectiveUserTier)}
+              {isSiteAdmin ? " • Site Admin" : ""}
             </p>
             <div className="mt-4 flex items-center gap-2">
               <button
