@@ -102,6 +102,7 @@ const STORAGE_KEYS = {
   lastTab: "last-tab",
   mapZoom: "map-zoom",
   followMap: "follow-map",
+  routeReplay: "route-replay-history",
 } as const;
 const SUBSCRIPTION_PLANS: ReadonlyArray<{
   id: SubscriptionPlan;
@@ -723,6 +724,94 @@ function computeDriveStatistics(
   };
 }
 
+const DRIVE_REPLAY_SOURCE = "drive-replay-trail";
+
+function clearDriveReplayTrail(map: mapboxgl.Map) {
+  if (map.getLayer("drive-replay-trail-line")) map.removeLayer("drive-replay-trail-line");
+  if (map.getLayer("drive-replay-trail-glow")) map.removeLayer("drive-replay-trail-glow");
+  if (map.getSource(DRIVE_REPLAY_SOURCE)) map.removeSource(DRIVE_REPLAY_SOURCE);
+}
+
+function upsertDriveReplayTrail(
+  map: mapboxgl.Map,
+  history: TrackingPoint[],
+  activeIndex: number
+) {
+  if (history.length < 2) {
+    clearDriveReplayTrail(map);
+    return;
+  }
+
+  const safeIndex = Math.max(0, Math.min(activeIndex, history.length - 1));
+  const coordinates = history
+    .slice(0, safeIndex + 1)
+    .map((point) => [point.lng, point.lat] as [number, number]);
+
+  if (coordinates.length < 2) {
+    clearDriveReplayTrail(map);
+    return;
+  }
+
+  const geojson = {
+    type: "FeatureCollection" as const,
+    features: [
+      {
+        type: "Feature" as const,
+        properties: {},
+        geometry: {
+          type: "LineString" as const,
+          coordinates,
+        },
+      },
+    ],
+  };
+
+  const existingSource = map.getSource(DRIVE_REPLAY_SOURCE) as
+    | mapboxgl.GeoJSONSource
+    | undefined;
+  if (existingSource) {
+    existingSource.setData(geojson);
+  } else {
+    map.addSource(DRIVE_REPLAY_SOURCE, { type: "geojson", data: geojson });
+  }
+
+  if (!map.getLayer("drive-replay-trail-glow")) {
+    map.addLayer({
+      id: "drive-replay-trail-glow",
+      type: "line",
+      source: DRIVE_REPLAY_SOURCE,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: {
+        "line-color": "#fbbf24",
+        "line-width": 10,
+        "line-opacity": 0.22,
+        "line-blur": 1.2,
+      },
+    });
+  }
+  if (!map.getLayer("drive-replay-trail-line")) {
+    map.addLayer({
+      id: "drive-replay-trail-line",
+      type: "line",
+      source: DRIVE_REPLAY_SOURCE,
+      layout: { "line-join": "round", "line-cap": "round" },
+      paint: {
+        "line-color": "#fbbf24",
+        "line-width": 4,
+        "line-opacity": 0.95,
+      },
+    });
+  }
+}
+
+function formatReplayClock(timestamp: number) {
+  return new Date(timestamp).toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function speakPaceNote(message: string) {
   if (typeof window === "undefined" || !window.speechSynthesis) return;
   window.speechSynthesis.cancel();
@@ -794,6 +883,9 @@ export default function Dashboard() {
   const friendMessageNotificationHydratedRef = useRef(false);
   const lastPaceNoteKeyRef = useRef<string | null>(null);
   const replayMarkerRef = useRef<mapboxgl.Marker | null>(null);
+  const replayIndexRef = useRef(0);
+  const routeTrackingHistoryRef = useRef<TrackingPoint[]>([]);
+  const previousRouteHistoryLengthRef = useRef(0);
 
   const [activeTab, setActiveTab] = useState<TabId>("dashboard");
   const [persistedMapZoom, setPersistedMapZoom] = useState<number | null>(null);
@@ -852,6 +944,7 @@ export default function Dashboard() {
   const [routeTrackingHistory, setRouteTrackingHistory] = useState<TrackingPoint[]>([]);
   const [tetherBreakCount, setTetherBreakCount] = useState(0);
   const [replayIndex, setReplayIndex] = useState(0);
+  const [isReplayScrubbing, setIsReplayScrubbing] = useState(false);
   const [isTierGateModalOpen, setIsTierGateModalOpen] = useState(false);
   const [tierGateMessage, setTierGateMessage] = useState("");
   const [convoyCalendarMonth, setConvoyCalendarMonth] = useState(() => new Date());
@@ -1075,11 +1168,24 @@ export default function Dashboard() {
     if (tabId !== "convoys") setIsCreateConvoyOpen(false);
     setIsMobileSidebarOpen(false);
   };
-  const driveStatistics = useMemo(
-    () => computeDriveStatistics(routeTrackingHistory, tetherBreakCount),
-    [routeTrackingHistory, tetherBreakCount]
+  const replayStatistics = useMemo(
+    () =>
+      computeDriveStatistics(
+        routeTrackingHistory.slice(0, replayIndex + 1),
+        replayIndex >= routeTrackingHistory.length - 1 ? tetherBreakCount : 0
+      ),
+    [replayIndex, routeTrackingHistory, tetherBreakCount]
   );
   const replayPoint = routeTrackingHistory[replayIndex] ?? null;
+  const replayProgressPercent = useMemo(() => {
+    if (routeTrackingHistory.length < 2) return 0;
+    return Math.round((replayIndex / (routeTrackingHistory.length - 1)) * 100);
+  }, [replayIndex, routeTrackingHistory.length]);
+  const replayStartTimestamp = routeTrackingHistory[0]?.timestamp ?? null;
+  const replayEndTimestamp =
+    routeTrackingHistory[routeTrackingHistory.length - 1]?.timestamp ?? null;
+  const isViewingPastReplay =
+    routeTrackingHistory.length >= 2 && replayIndex < routeTrackingHistory.length - 1;
   const convoyCalendarDays = useMemo(() => {
     const year = convoyCalendarMonth.getFullYear();
     const month = convoyCalendarMonth.getMonth();
@@ -1518,6 +1624,22 @@ export default function Dashboard() {
     );
     if (Array.isArray(storedFavorites)) setFavoriteRoutes(storedFavorites);
 
+    const storedRouteReplay = readStorage<TrackingPoint[]>(
+      `${storagePrefix}${STORAGE_KEYS.routeReplay}`
+    );
+    if (Array.isArray(storedRouteReplay)) {
+      const sanitizedReplay = storedRouteReplay.filter(
+        (point) =>
+          point &&
+          typeof point.lat === "number" &&
+          typeof point.lng === "number" &&
+          typeof point.timestamp === "number"
+      );
+      if (sanitizedReplay.length > 0) {
+        setRouteTrackingHistory(sanitizedReplay.slice(-ROUTE_HISTORY_MAX_POINTS));
+      }
+    }
+
     const storedNotifications = readStorage<NotificationItem[]>(
       `${storagePrefix}${STORAGE_KEYS.notifications}`
     );
@@ -1617,6 +1739,11 @@ export default function Dashboard() {
     if (!storageHydrated || !storagePrefix) return;
     writeStorage(`${storagePrefix}${STORAGE_KEYS.notifications}`, notifications);
   }, [notifications, storageHydrated, storagePrefix]);
+
+  useEffect(() => {
+    if (!storageHydrated || !storagePrefix) return;
+    writeStorage(`${storagePrefix}${STORAGE_KEYS.routeReplay}`, routeTrackingHistory);
+  }, [routeTrackingHistory, storageHydrated, storagePrefix]);
 
   useEffect(() => {
     if (!storageHydrated || !storagePrefix) return;
@@ -1949,31 +2076,87 @@ export default function Dashboard() {
   ]);
 
   useEffect(() => {
+    replayIndexRef.current = replayIndex;
+  }, [replayIndex]);
+
+  useEffect(() => {
+    routeTrackingHistoryRef.current = routeTrackingHistory;
+  }, [routeTrackingHistory]);
+
+  useEffect(() => {
+    const previousLength = previousRouteHistoryLengthRef.current;
+    const nextLength = routeTrackingHistory.length;
+    previousRouteHistoryLengthRef.current = nextLength;
+
+    if (nextLength === 0) {
+      setReplayIndex(0);
+      return;
+    }
+
+    setReplayIndex((current) => {
+      if (current > nextLength - 1) return nextLength - 1;
+      if (previousLength > 0 && current >= previousLength - 1) return nextLength - 1;
+      return current;
+    });
+  }, [routeTrackingHistory.length]);
+
+  useEffect(() => {
+    const marker = userMarkerRef.current;
+    if (!marker) return;
+    const hideLiveMarker = isViewingPastReplay || isReplayScrubbing;
+    marker.getElement().style.opacity = hideLiveMarker ? "0" : "1";
+    marker.getElement().style.pointerEvents = hideLiveMarker ? "none" : "auto";
+  }, [isReplayScrubbing, isViewingPastReplay]);
+
+  useEffect(() => {
     if (routeTrackingHistory.length < 2) {
       replayMarkerRef.current?.remove();
       replayMarkerRef.current = null;
+      const map = mapRef.current;
+      if (map?.isStyleLoaded()) clearDriveReplayTrail(map);
       return;
     }
+
     if (!replayPoint || !mapRef.current) return;
     const map = mapRef.current;
     if (!map.isStyleLoaded()) return;
+
+    upsertDriveReplayTrail(map, routeTrackingHistory, replayIndex);
+
     const center: [number, number] = [replayPoint.lng, replayPoint.lat];
     if (replayMarkerRef.current) {
       replayMarkerRef.current.setLngLat(center);
-      return;
+    } else {
+      const markerEl = document.createElement("div");
+      markerEl.style.cssText =
+        "width:14px;height:14px;background:#fbbf24;border:3px solid #fff;border-radius:50%;box-shadow:0 0 14px rgba(251,191,36,0.95);";
+      replayMarkerRef.current = new mapboxgl.Marker({ element: markerEl, anchor: "center" })
+        .setLngLat(center)
+        .addTo(map);
     }
-    const markerEl = document.createElement("div");
-    markerEl.style.cssText =
-      "width:12px;height:12px;background:#fbbf24;border:2px solid #fff;border-radius:50%;box-shadow:0 0 12px rgba(251,191,36,0.9);";
-    replayMarkerRef.current = new mapboxgl.Marker({ element: markerEl, anchor: "center" })
-      .setLngLat(center)
-      .addTo(map);
-  }, [replayPoint, routeTrackingHistory.length]);
+
+    if (isViewingPastReplay || isReplayScrubbing) {
+      map.easeTo({
+        center,
+        zoom: Math.max(map.getZoom(), 12.5),
+        duration: isReplayScrubbing ? 180 : 320,
+        essential: true,
+      });
+    }
+  }, [
+    isReplayScrubbing,
+    isViewingPastReplay,
+    replayIndex,
+    replayPoint,
+    routeTrackingHistory,
+  ]);
 
   useEffect(() => {
     return () => {
       replayMarkerRef.current?.remove();
       replayMarkerRef.current = null;
+      const map = mapRef.current;
+      if (map?.isStyleLoaded()) clearDriveReplayTrail(map);
     };
   }, []);
 
@@ -2642,10 +2825,13 @@ export default function Dashboard() {
 
     const map = mapRef.current;
     if (map && map.isStyleLoaded()) {
+      const atLiveReplayEdge =
+        routeTrackingHistoryRef.current.length === 0 ||
+        replayIndexRef.current >= routeTrackingHistoryRef.current.length - 1;
       const shouldFollow =
-        source === "gps"
-          ? routeNavigationActiveRef.current || followMeEnabledRef.current
-          : true;
+        source === "gps" &&
+        atLiveReplayEdge &&
+        (routeNavigationActiveRef.current || followMeEnabledRef.current);
       syncUserLocationOnMap(map, location, shouldFollow, source === "gps");
     }
 
@@ -3025,6 +3211,12 @@ export default function Dashboard() {
 
         if (userLocationRef.current) {
           syncUserLocationOnMap(map, userLocationRef.current, true, false);
+        }
+
+        const replayHistory = routeTrackingHistoryRef.current;
+        const replayFrame = replayIndexRef.current;
+        if (replayHistory.length >= 2) {
+          upsertDriveReplayTrail(map, replayHistory, replayFrame);
         }
 
         if (interactionHandlersAttached) return;
@@ -3431,7 +3623,8 @@ export default function Dashboard() {
     const payload = {
       tier: effectiveUserTier,
       exportedAt: new Date().toISOString(),
-      statistics: driveStatistics,
+      statistics: replayStatistics,
+      replayProgressPercent,
       routePoints: routeTrackingHistory.length,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], {
@@ -3447,6 +3640,40 @@ export default function Dashboard() {
       type: "system",
       text: "Drive statistics exported successfully.",
     });
+  };
+
+  const handleClearRouteReplay = () => {
+    if (routeTrackingHistory.length === 0) return;
+
+    const confirmed = window.confirm(
+      "Clear this post-drive replay and remove all recorded GPS points?"
+    );
+    if (!confirmed) return;
+
+    setRouteTrackingHistory([]);
+    setReplayIndex(0);
+    setIsReplayScrubbing(false);
+    replayMarkerRef.current?.remove();
+    replayMarkerRef.current = null;
+
+    const map = mapRef.current;
+    if (map?.isStyleLoaded()) {
+      clearDriveReplayTrail(map);
+    }
+
+    if (storagePrefix) {
+      writeStorage(`${storagePrefix}${STORAGE_KEYS.routeReplay}`, []);
+    }
+
+    pushNotification({
+      type: "system",
+      text: "Post-drive replay cleared.",
+    });
+  };
+
+  const handleReplayIndexChange = (nextIndex: number) => {
+    const maxIndex = Math.max(routeTrackingHistory.length - 1, 0);
+    setReplayIndex(Math.max(0, Math.min(nextIndex, maxIndex)));
   };
 
   const handleAddVehicleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
@@ -5082,14 +5309,25 @@ export default function Dashboard() {
               </div>
 
               <div className="bg-[#111215] border border-white/[0.03] rounded-2xl p-4 shadow-xl">
-                <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center justify-between mb-3 gap-3">
                   <p className="text-[10px] font-mono text-gray-400 font-bold uppercase">
                     Post-Drive Route Replay
                   </p>
-                  <span className="text-[9px] font-mono text-gray-600">
-                    {routeTrackingHistory.length} GPS{" "}
-                    {routeTrackingHistory.length === 1 ? "point" : "points"}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[9px] font-mono text-gray-600">
+                      {routeTrackingHistory.length} GPS{" "}
+                      {routeTrackingHistory.length === 1 ? "point" : "points"}
+                    </span>
+                    {routeTrackingHistory.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleClearRouteReplay}
+                        className="text-[9px] font-mono uppercase text-rose-300 hover:text-rose-200 border border-rose-500/30 rounded-lg px-2 py-1"
+                      >
+                        Clear Replay
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {routeTrackingHistory.length < 2 ? (
                   <p className="text-[10px] text-gray-500 leading-relaxed">
@@ -5099,36 +5337,65 @@ export default function Dashboard() {
                   </p>
                 ) : (
                   <div className="space-y-3">
-                    <input
-                      type="range"
-                      min={0}
-                      max={Math.max(routeTrackingHistory.length - 1, 0)}
-                      value={replayIndex}
-                      onChange={(event) => setReplayIndex(Number.parseInt(event.target.value, 10))}
-                      className="w-full accent-[#00F2FE]"
-                    />
-                    <p className="text-[10px] font-mono text-gray-400">
-                      Replay frame {replayIndex + 1}/{routeTrackingHistory.length}
-                      {replayPoint
-                        ? ` • ${new Date(replayPoint.timestamp).toLocaleTimeString()}`
-                        : ""}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between text-[9px] font-mono text-gray-500 uppercase">
+                        <span>
+                          {replayStartTimestamp
+                            ? formatReplayClock(replayStartTimestamp)
+                            : "Start"}
+                        </span>
+                        <span className="text-amber-300">
+                          {replayPoint ? formatReplayClock(replayPoint.timestamp) : "--"}
+                        </span>
+                        <span>
+                          {replayEndTimestamp ? formatReplayClock(replayEndTimestamp) : "End"}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={Math.max(routeTrackingHistory.length - 1, 0)}
+                        value={replayIndex}
+                        onChange={(event) =>
+                          handleReplayIndexChange(Number.parseInt(event.target.value, 10))
+                        }
+                        onPointerDown={() => setIsReplayScrubbing(true)}
+                        onPointerUp={() => setIsReplayScrubbing(false)}
+                        onPointerCancel={() => setIsReplayScrubbing(false)}
+                        onTouchEnd={() => setIsReplayScrubbing(false)}
+                        className="w-full h-2 rounded-full appearance-none cursor-pointer bg-[#16171b] accent-[#fbbf24]"
+                        aria-label="Scrub post-drive route replay"
+                      />
+                      <div className="flex items-center justify-between text-[10px] font-mono text-gray-400">
+                        <span>
+                          Moment {replayIndex + 1}/{routeTrackingHistory.length}
+                        </span>
+                        <span>{replayProgressPercent}% through drive</span>
+                      </div>
+                    </div>
+                    <p className="text-[10px] text-gray-500 leading-relaxed">
+                      {isViewingPastReplay
+                        ? "Scrubbing replay — only the driven path up to this moment is shown on the map."
+                        : "Live edge — replay is synced to your latest GPS point."}
                     </p>
                     <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
                       <div className="bg-[#16171b] border border-white/[0.04] rounded-lg px-2 py-1.5">
                         <span className="text-gray-500 block text-[8px] uppercase">Distance</span>
-                        <span className="text-white">{formatRouteDistance(driveStatistics.totalMiles)}</span>
+                        <span className="text-white">
+                          {formatRouteDistance(replayStatistics.totalMiles)}
+                        </span>
                       </div>
                       <div className="bg-[#16171b] border border-white/[0.04] rounded-lg px-2 py-1.5">
                         <span className="text-gray-500 block text-[8px] uppercase">Duration</span>
-                        <span className="text-white">{driveStatistics.durationMinutes} min</span>
+                        <span className="text-white">{replayStatistics.durationMinutes} min</span>
                       </div>
                       <div className="bg-[#16171b] border border-white/[0.04] rounded-lg px-2 py-1.5">
                         <span className="text-gray-500 block text-[8px] uppercase">Max Speed</span>
-                        <span className="text-white">{driveStatistics.maxSpeedMph} mph</span>
+                        <span className="text-white">{replayStatistics.maxSpeedMph} mph</span>
                       </div>
                       <div className="bg-[#16171b] border border-white/[0.04] rounded-lg px-2 py-1.5">
                         <span className="text-gray-500 block text-[8px] uppercase">Tether Breaks</span>
-                        <span className="text-white">{driveStatistics.tetherBreakCount}</span>
+                        <span className="text-white">{replayStatistics.tetherBreakCount}</span>
                       </div>
                     </div>
                     <button
